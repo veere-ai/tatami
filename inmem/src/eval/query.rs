@@ -99,7 +99,7 @@ fn evaluate_series<'s>(
     rows: &crate::resolve::ResolvedSet<'s>,
     cube: &'s InMemoryCube,
 ) -> Result<Results, Error> {
-    let row_tuples = set::evaluate(rows, cube)?;
+    let row_tuples = prune_axis_by_slicer(set::evaluate(rows, cube)?, &resolved.slicer);
 
     // Build the `Vec<MemberRef>` x-axis from each row tuple's sole member.
     // A series-axis tuple may carry any number of members (cross-joined);
@@ -158,17 +158,17 @@ fn evaluate_pivot<'s>(
     cube: &'s InMemoryCube,
 ) -> Result<Results, Error> {
     if is_descendants(rows) {
-        let row_tuples = set::evaluate(rows, cube)?;
+        let row_tuples = prune_axis_by_slicer(set::evaluate(rows, cube)?, &resolved.slicer);
         if let Some(root) = single_root_member(&row_tuples) {
             return evaluate_rollup(resolved, row_tuples, root, cube);
         }
         // Fall through: multi-root `Descendants` produces a flat pivot
         // with one row per tuple, same as any other set on the rows axis.
-        let col_tuples = set::evaluate(columns, cube)?;
+        let col_tuples = prune_axis_by_slicer(set::evaluate(columns, cube)?, &resolved.slicer);
         return build_pivot(resolved, row_tuples, col_tuples, cube);
     }
-    let row_tuples = set::evaluate(rows, cube)?;
-    let col_tuples = set::evaluate(columns, cube)?;
+    let row_tuples = prune_axis_by_slicer(set::evaluate(rows, cube)?, &resolved.slicer);
+    let col_tuples = prune_axis_by_slicer(set::evaluate(columns, cube)?, &resolved.slicer);
     build_pivot(resolved, row_tuples, col_tuples, cube)
 }
 
@@ -223,9 +223,9 @@ fn evaluate_pages<'s>(
     pages: &crate::resolve::ResolvedSet<'s>,
     cube: &'s InMemoryCube,
 ) -> Result<Results, Error> {
-    let row_tuples = set::evaluate(rows, cube)?;
-    let col_tuples = set::evaluate(columns, cube)?;
-    let page_tuples = set::evaluate(pages, cube)?;
+    let row_tuples = prune_axis_by_slicer(set::evaluate(rows, cube)?, &resolved.slicer);
+    let col_tuples = prune_axis_by_slicer(set::evaluate(columns, cube)?, &resolved.slicer);
+    let page_tuples = prune_axis_by_slicer(set::evaluate(pages, cube)?, &resolved.slicer);
 
     // Widen columns by the page axis: for each page, every column tuple
     // paired with it becomes a top-level column header. Order is
@@ -242,6 +242,26 @@ fn evaluate_pages<'s>(
         }
     }
     build_pivot(resolved, row_tuples, widened, cube)
+}
+
+/// Apply slicer AUTOEXISTS to an axis before public headers are minted.
+///
+/// A slicer member from the same dimension/hierarchy narrows an axis to
+/// compatible members. This is the enterprise dashboard default: drilling a
+/// region and showing state-level members yields states in that region, not a
+/// full country list with `Missing` cells outside the region. Sparse fact
+/// rows on disjoint dimensions still flow through to `options.non_empty`.
+fn prune_axis_by_slicer<'s>(
+    tuples: Vec<ResolvedTuple<'s>>,
+    slicer: &ResolvedTuple<'s>,
+) -> Vec<ResolvedTuple<'s>> {
+    if slicer.members.is_empty() {
+        return tuples;
+    }
+    tuples
+        .into_iter()
+        .filter(|tuple| intersect(slicer, tuple).is_some())
+        .collect()
 }
 
 /// Assemble a pivot result from already-evaluated row and column tuple
@@ -1091,7 +1111,8 @@ mod tests {
 
     /// Slicer pins a region; rows list countries. Countries under the
     /// pinned region survive (deeper path wins the intersection);
-    /// countries under a different region collapse to `Cell::Missing`.
+    /// countries under a different region are pruned before public
+    /// series headers are minted.
     #[test]
     fn autoexists_slicer_and_axis_same_dim_narrow_to_compatible_rows() {
         let cube = fixture_cube();
@@ -1115,7 +1136,11 @@ mod tests {
                     .iter()
                     .map(|m| m.path.segments().last().expect("non-empty").as_str())
                     .collect();
-                assert_eq!(leaves, vec!["JP", "SG", "FR", "UK"], "catalogue order");
+                assert_eq!(
+                    leaves,
+                    vec!["FR", "UK"],
+                    "axis narrows to the pinned region"
+                );
                 let values = &s.rows()[0].values;
                 let by = |leaf: &str| -> &Cell {
                     let idx = leaves.iter().position(|s| *s == leaf).expect("leaf");
@@ -1129,8 +1154,6 @@ mod tests {
                     Cell::Valid { value, .. } => assert_eq!(*value, 200.0),
                     other => panic!("FR expected Valid, got {other:?}"),
                 }
-                assert!(matches!(by("JP"), Cell::Missing { .. }));
-                assert!(matches!(by("SG"), Cell::Missing { .. }));
             }
             other => panic!("expected Series, got {other:?}"),
         }
