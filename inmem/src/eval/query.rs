@@ -47,7 +47,7 @@
 
 use std::cmp::Ordering;
 
-use tatami::query::{MemberRef, Path, Tuple};
+use tatami::query::{Direction, MemberRef, OrderKey, Path, Tuple};
 use tatami::schema::metric::Expr;
 use tatami::schema::{Metric, Name};
 use tatami::{Cell, Results, missing, pivot, rollup, scalar, series};
@@ -498,39 +498,47 @@ fn apply_options_series(
         }
     }
 
-    // Order: sort x and every row's values in tandem by the first ordering
-    // metric's row values, if it matches one of the requested metrics.
-    if let Some(ob) = opts.order.first()
-        && let Some(metric_idx) = resolved
-            .metrics
-            .iter()
-            .position(|h| metric_name(h) == &ob.metric)
-    {
-        let mut indices: Vec<usize> = (0..x.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let va = cell_score(&rows[metric_idx].values[a]);
-            let vb = cell_score(&rows[metric_idx].values[b]);
-            let base = va.partial_cmp(&vb).unwrap_or(Ordering::Equal);
-            match ob.direction {
-                tatami::query::Direction::Asc => base,
-                tatami::query::Direction::Desc => base.reverse(),
-                _ => base,
-            }
-        });
-        x = permute(x, &indices);
-        for r in rows.iter_mut() {
-            r.values = permute(std::mem::take(&mut r.values), &indices);
+    // Position order: top-N rank (an independent rank metric), then the
+    // display ordering (dimension member or metric value, first key primary),
+    // then the limit. `permute` reorders + truncates in one pass.
+    let mut idx: Vec<usize> = (0..x.len()).collect();
+
+    let mut ranked = false;
+    if let Some(rank) = &opts.rank {
+        if let Some(mi) = metric_position(resolved, &rank.metric) {
+            sort_indices_by_metric(&mut idx, &rows[mi].values, rank.direction);
+        }
+        if let Some(n) = opts.limit {
+            idx.truncate(n.get().min(idx.len()));
+            ranked = true;
         }
     }
 
-    // Limit: truncate x and each row's values.
-    if let Some(n) = opts.limit {
-        let cap = n.get().min(x.len());
-        x.truncate(cap);
-        for r in rows.iter_mut() {
-            r.values.truncate(cap);
+    for ob in opts.order.iter().rev() {
+        match &ob.key {
+            OrderKey::Metric(name) => {
+                if let Some(mi) = metric_position(resolved, name) {
+                    sort_indices_by_metric(&mut idx, &rows[mi].values, ob.direction);
+                }
+            }
+            OrderKey::Dimension(_) => {
+                sort_indices_by_member(&mut idx, &x, ob.direction);
+            }
         }
     }
+
+    if !ranked && let Some(n) = opts.limit {
+        idx.truncate(n.get().min(idx.len()));
+    }
+
+    let x = permute(x, &idx);
+    let rows = rows
+        .into_iter()
+        .map(|mut row| {
+            row.values = permute(std::mem::take(&mut row.values), &idx);
+            row
+        })
+        .collect();
 
     (x, rows)
 }
@@ -554,36 +562,38 @@ fn apply_options_pivot(
         cells = filter_by_mask(cells, &keep);
     }
 
-    if let Some(ob) = opts.order.first()
-        && let Some(metric_idx) = resolved
-            .metrics
-            .iter()
-            .position(|h| metric_name(h) == &ob.metric)
-    {
-        // Sort by the first column's value of the chosen metric.
-        // `cells[r][0 * n_metrics + metric_idx] == cells[r][metric_idx]`
-        // — metric_idx slots in directly because column 0 lies at byte 0
-        // of the metric-widened row.
-        let mut indices: Vec<usize> = (0..row_headers.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let va = cell_score(cells[a].get(metric_idx).unwrap_or(&no_facts_cell()));
-            let vb = cell_score(cells[b].get(metric_idx).unwrap_or(&no_facts_cell()));
-            let base = va.partial_cmp(&vb).unwrap_or(Ordering::Equal);
-            match ob.direction {
-                tatami::query::Direction::Asc => base,
-                tatami::query::Direction::Desc => base.reverse(),
-                _ => base,
-            }
-        });
-        row_headers = permute(row_headers, &indices);
-        cells = permute(cells, &indices);
+    // Position order over pivot rows: top-N rank + metric ordering + limit.
+    // A metric slots in at `cells[row][metric_idx]` (column 0 of the
+    // metric-widened row). Ordering a 2-D grid by a *dimension* (which row
+    // level?) is a follow-up; dimension order keys are left in resolution
+    // order here.
+    let mut idx: Vec<usize> = (0..row_headers.len()).collect();
+
+    let mut ranked = false;
+    if let Some(rank) = &opts.rank {
+        if let Some(mi) = metric_position(resolved, &rank.metric) {
+            sort_pivot_rows_by_metric(&mut idx, &cells, mi, rank.direction);
+        }
+        if let Some(n) = opts.limit {
+            idx.truncate(n.get().min(idx.len()));
+            ranked = true;
+        }
     }
 
-    if let Some(n) = opts.limit {
-        let cap = n.get().min(row_headers.len());
-        row_headers.truncate(cap);
-        cells.truncate(cap);
+    for ob in opts.order.iter().rev() {
+        if let OrderKey::Metric(name) = &ob.key
+            && let Some(mi) = metric_position(resolved, name)
+        {
+            sort_pivot_rows_by_metric(&mut idx, &cells, mi, ob.direction);
+        }
     }
+
+    if !ranked && let Some(n) = opts.limit {
+        idx.truncate(n.get().min(idx.len()));
+    }
+
+    let row_headers = permute(row_headers, &idx);
+    let cells = permute(cells, &idx);
 
     (row_headers, cells)
 }
@@ -597,6 +607,51 @@ fn cell_score(cell: &Cell) -> f64 {
         Cell::Valid { value, .. } => *value,
         _ => f64::NEG_INFINITY,
     }
+}
+
+/// Position of the requested metric named `name` among the resolved metrics.
+fn metric_position(resolved: &ResolvedQuery<'_>, name: &Name) -> Option<usize> {
+    resolved.metrics.iter().position(|h| metric_name(h) == name)
+}
+
+/// Compare two scores under `direction`. `Asc` is natural; `Desc` reverses.
+fn direction_cmp(a: f64, b: f64, direction: Direction) -> Ordering {
+    let base = a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+    match direction {
+        Direction::Desc => base.reverse(),
+        _ => base,
+    }
+}
+
+/// Stable-sort `idx` by a series metric's values at each index, in `direction`.
+fn sort_indices_by_metric(idx: &mut [usize], values: &[Cell], direction: Direction) {
+    idx.sort_by(|&a, &b| direction_cmp(cell_score(&values[a]), cell_score(&values[b]), direction));
+}
+
+/// Stable-sort `idx` by the x-axis member's path key at each index, in
+/// `direction` (lexical; ISO dates sort chronologically).
+fn sort_indices_by_member(idx: &mut [usize], x: &[MemberRef], direction: Direction) {
+    idx.sort_by(|&a, &b| {
+        let base = x[a].path.to_string().cmp(&x[b].path.to_string());
+        match direction {
+            Direction::Desc => base.reverse(),
+            _ => base,
+        }
+    });
+}
+
+/// Stable-sort pivot row indices by a metric's value (column 0) at each row.
+fn sort_pivot_rows_by_metric(
+    idx: &mut [usize],
+    cells: &[Vec<Cell>],
+    metric_idx: usize,
+    direction: Direction,
+) {
+    idx.sort_by(|&a, &b| {
+        let va = cell_score(cells[a].get(metric_idx).unwrap_or(&no_facts_cell()));
+        let vb = cell_score(cells[b].get(metric_idx).unwrap_or(&no_facts_cell()));
+        direction_cmp(va, vb, direction)
+    });
 }
 
 /// Keep entries of `v` whose mask is `true`; drop the rest.
@@ -744,7 +799,9 @@ mod tests {
     use polars_core::df;
     use polars_core::prelude::DataFrame;
     use std::num::NonZeroUsize;
-    use tatami::query::{Axes, Direction, MemberRef as MRef, OrderBy, Path, Predicate, Set, Tuple};
+    use tatami::query::{
+        Axes, Direction, MemberRef as MRef, OrderBy, OrderKey, Path, Predicate, Set, Tuple,
+    };
     use tatami::schema::{
         Aggregation, Calendar, Dimension, Hierarchy, Level, Measure, Metric, Schema, metric::Expr,
     };
@@ -1223,7 +1280,7 @@ mod tests {
             metrics: vec![n("amount")],
             options: tatami::query::Options {
                 order: vec![OrderBy {
-                    metric: n("amount"),
+                    key: OrderKey::Metric(n("amount")),
                     direction: Direction::Desc,
                 }],
                 ..tatami::query::Options::default()
@@ -1256,7 +1313,7 @@ mod tests {
             metrics: vec![n("amount")],
             options: tatami::query::Options {
                 order: vec![OrderBy {
-                    metric: n("amount"),
+                    key: OrderKey::Metric(n("amount")),
                     direction: Direction::Desc,
                 }],
                 limit: Some(NonZeroUsize::new(2).expect("nonzero")),
@@ -1276,6 +1333,83 @@ mod tests {
             }
             other => panic!("expected Series, got {other:?}"),
         }
+    }
+
+    /// Rank is independent of display order: keep the top 2 by `amount`
+    /// (SG=400, JP=300), but display them *ascending* by amount → JP, SG.
+    #[test]
+    fn rank_keeps_top_n_then_displays_in_chosen_order() {
+        let cube = fixture_cube();
+        let q = Query {
+            axes: Axes::Series {
+                rows: Set::members(n("Geography"), n("Default"), n("Country")),
+            },
+            slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
+            metrics: vec![n("amount")],
+            options: tatami::query::Options {
+                rank: Some(tatami::query::Rank {
+                    metric: n("amount"),
+                    direction: Direction::Desc,
+                }),
+                limit: Some(NonZeroUsize::new(2).expect("nonzero")),
+                order: vec![OrderBy {
+                    key: OrderKey::Metric(n("amount")),
+                    direction: Direction::Asc,
+                }],
+                ..tatami::query::Options::default()
+            },
+        };
+        let r = run_query(&cube, q);
+        match r {
+            Results::Series(s) => {
+                let leaves: Vec<&str> = s
+                    .x()
+                    .iter()
+                    .map(|m| m.path.segments().last().expect("non-empty").as_str())
+                    .collect();
+                assert_eq!(
+                    leaves,
+                    vec!["JP", "SG"],
+                    "top-2 by amount, shown amount-ascending"
+                );
+            }
+            other => panic!("expected Series, got {other:?}"),
+        }
+    }
+
+    /// Ordering by a dimension key reverses cleanly between asc and desc
+    /// (a time axis sorts chronologically / reverse-chronologically).
+    #[test]
+    fn order_by_dimension_reverses_with_direction() {
+        let cube = fixture_cube();
+        let leaves = |direction| {
+            let q = Query {
+                axes: Axes::Series {
+                    rows: Set::members(n("Geography"), n("Default"), n("Country")),
+                },
+                slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
+                metrics: vec![n("amount")],
+                options: tatami::query::Options {
+                    order: vec![OrderBy {
+                        key: OrderKey::Dimension(n("Geography")),
+                        direction,
+                    }],
+                    ..tatami::query::Options::default()
+                },
+            };
+            match run_query(&cube, q) {
+                Results::Series(s) => s.x().iter().map(|m| m.path.to_string()).collect::<Vec<_>>(),
+                other => panic!("expected Series, got {other:?}"),
+            }
+        };
+        let asc = leaves(Direction::Asc);
+        let mut desc = leaves(Direction::Desc);
+        desc.reverse();
+        assert_eq!(asc, desc, "asc and desc are mirror orders");
+        assert!(
+            asc.windows(2).all(|w| w[0] <= w[1]),
+            "asc is sorted by member key"
+        );
     }
 
     /// Minimal hewton-shaped schema and one fact row, so end-to-end

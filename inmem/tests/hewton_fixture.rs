@@ -697,7 +697,7 @@ async fn order_and_limit_apply_post_evaluation() {
         metrics: vec![fixture::n("amount")],
         options: Options {
             order: vec![OrderBy {
-                metric: fixture::n("amount"),
+                key: tatami::query::OrderKey::Metric(fixture::n("amount")),
                 direction: tatami::query::Direction::Desc,
             }],
             limit: Some(NonZeroUsize::new(1).expect("nonzero")),

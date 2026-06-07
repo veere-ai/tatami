@@ -146,9 +146,10 @@ fn query_with_order_and_limit_roundtrips() {
         metrics: vec![n("Revenue")],
         options: query::Options {
             order: vec![OrderBy {
-                metric: n("Revenue"),
+                key: query::OrderKey::Metric(n("Revenue")),
                 direction: Direction::Desc,
             }],
+            rank: None,
             limit: Some(NonZeroUsize::new(10).expect("nonzero")),
             non_empty: true,
         },

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub use axes::Axes;
 pub use error::Error;
 pub use member_ref::MemberRef;
-pub use options::{Direction, Options, OrderBy};
+pub use options::{Direction, Options, OrderBy, OrderKey, Rank};
 pub use path::Path;
 pub use predicate::Predicate;
 pub use set::Set;

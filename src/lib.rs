@@ -67,7 +67,9 @@ pub mod query;
 pub mod results;
 pub mod schema;
 
-pub use query::{Axes, Direction, MemberRef, OrderBy, Path, Predicate, Query, Set, Tuple};
+pub use query::{
+    Axes, Direction, MemberRef, OrderBy, OrderKey, Path, Predicate, Query, Rank, Set, Tuple,
+};
 pub use schema::Schema;
 
 // `Expr` at crate root — it's the formula-tree constructor, used often in

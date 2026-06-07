@@ -448,9 +448,15 @@ pub(crate) fn resolve<'s>(
             check_expr(&ctx, &metric.expr)?;
         }
     }
-    // Validate `options.order[*].metric` references.
+    // Validate metric references in the display order + top-N rank. Dimension
+    // order keys aren't metrics, so they're not metric-resolved here.
     for ob in &q.options.order {
-        let _ = resolve_metric_ref(&ctx, &ob.metric)?;
+        if let tatami::query::OrderKey::Metric(name) = &ob.key {
+            let _ = resolve_metric_ref(&ctx, name)?;
+        }
+    }
+    if let Some(rank) = &q.options.rank {
+        let _ = resolve_metric_ref(&ctx, &rank.metric)?;
     }
     Ok(ResolvedQuery {
         schema,
