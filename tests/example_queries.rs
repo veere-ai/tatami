@@ -11,7 +11,7 @@
 //! demonstrates the same closure with `Union`.
 
 use tatami::query::{self, Set, Tuple};
-use tatami::schema::Name;
+use tatami::schema::{Aggregation, Name};
 use tatami::{Axes, MemberRef, OrderBy, Path, Query};
 
 fn n(s: &str) -> Name {
@@ -34,7 +34,10 @@ fn fy2026_revenue_with_mom_delta_scalar_roundtrips() {
             MemberRef::new(n("Scenario"), n("Default"), Path::of(n("Actual"))),
         ])
         .expect("distinct dims"),
-        metrics: vec![n("Revenue"), n("RevenueMoM")],
+        metrics: vec![
+            query::Metric::derived(n("Revenue")),
+            query::Metric::derived(n("RevenueMoM")),
+        ],
         options: query::Options::default(),
     };
     roundtrip(&q);
@@ -60,7 +63,7 @@ fn quarterly_revenue_by_region_pivot_roundtrips() {
             },
         },
         slicer: Tuple::of([MemberRef::scenario(n("Actual"))]).expect("distinct dims"),
-        metrics: vec![n("Revenue")],
+        metrics: vec![query::Metric::derived(n("Revenue"))],
         options: query::Options {
             non_empty: true,
             ..Default::default()
@@ -85,7 +88,11 @@ fn aop_plan_vs_whatif_pivot_roundtrips() {
             .expect("non-empty members"),
         },
         slicer: Tuple::of([MemberRef::time(n("FY2026"))]).expect("distinct dims"),
-        metrics: vec![n("Amount"), n("Variance"), n("VariancePct")],
+        metrics: vec![
+            query::Metric::aggregated(n("Amount"), Aggregation::sum()),
+            query::Metric::derived(n("Variance")),
+            query::Metric::derived(n("VariancePct")),
+        ],
         options: query::Options::default(),
     };
     roundtrip(&q);
@@ -103,7 +110,7 @@ fn sales_volume_by_territory_series_roundtrips() {
             MemberRef::scenario(n("Actual")),
         ])
         .expect("distinct dims"),
-        metrics: vec![n("Units")],
+        metrics: vec![query::Metric::aggregated(n("Units"), Aggregation::sum())],
         options: query::Options::default(),
     };
     roundtrip(&q);
@@ -121,7 +128,7 @@ fn descendants_of_union_roundtrips() {
             ),
         },
         slicer: Tuple::of([MemberRef::scenario(n("Actual"))]).expect("distinct dims"),
-        metrics: vec![n("Revenue")],
+        metrics: vec![query::Metric::derived(n("Revenue"))],
         options: query::Options::default(),
     };
     roundtrip(&q);
@@ -143,7 +150,7 @@ fn query_with_order_and_limit_roundtrips() {
             },
         },
         slicer: Tuple::empty(),
-        metrics: vec![n("Revenue")],
+        metrics: vec![query::Metric::derived(n("Revenue"))],
         options: query::Options {
             order: vec![OrderBy {
                 key: query::OrderKey::Metric(n("Revenue")),

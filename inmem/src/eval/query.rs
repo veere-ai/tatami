@@ -48,15 +48,16 @@
 use std::cmp::Ordering;
 
 use tatami::query::{Direction, MemberRef, OrderKey, Path, Tuple};
+use tatami::schema::Name;
 use tatami::schema::metric::Expr;
-use tatami::schema::{Metric, Name};
 use tatami::{Cell, Results, missing, pivot, rollup, scalar, series};
 
 use crate::Error;
 use crate::InMemoryCube;
+use crate::eval::aggregate::evaluate_measure;
 use crate::eval::metric::evaluate_expr;
 use crate::eval::set;
-use crate::resolve::{MetricHandle, ResolvedAxes, ResolvedMember, ResolvedQuery, ResolvedTuple};
+use crate::resolve::{ResolvedAxes, ResolvedMember, ResolvedMetric, ResolvedQuery, ResolvedTuple};
 
 /// Evaluate a resolved query end-to-end, producing a typed [`Results`]
 /// value.
@@ -122,12 +123,12 @@ fn evaluate_series<'s>(
     // (slicer pins a dim with a path incompatible with the row) yields
     // `Cell::Missing` rather than evaluating.
     let mut series_rows: Vec<series::Row> = Vec::with_capacity(resolved.metrics.len());
-    for metric_handle in &resolved.metrics {
-        let label = metric_name(metric_handle).as_str().to_owned();
+    for metric in &resolved.metrics {
+        let label = metric.name().as_str().to_owned();
         let mut values: Vec<Cell> = Vec::with_capacity(row_tuples.len());
         for row_tuple in &row_tuples {
             let cell = match intersect(&resolved.slicer, row_tuple) {
-                Some(merged) => evaluate_metric(metric_handle, &merged, cube)?,
+                Some(merged) => evaluate_metric(metric, &merged, cube)?,
                 None => no_facts_cell(),
             };
             values.push(cell);
@@ -283,9 +284,9 @@ fn build_pivot<'s>(
         let mut row_cells: Vec<Cell> = Vec::with_capacity(col_tuples.len() * n_metrics);
         for col_tuple in &col_tuples {
             let merged = merged_row.as_ref().and_then(|mr| intersect(mr, col_tuple));
-            for metric_handle in &resolved.metrics {
+            for metric in &resolved.metrics {
                 match &merged {
-                    Some(m) => row_cells.push(evaluate_metric(metric_handle, m, cube)?),
+                    Some(m) => row_cells.push(evaluate_metric(metric, m, cube)?),
                     None => row_cells.push(no_facts_cell()),
                 }
             }
@@ -611,7 +612,7 @@ fn cell_score(cell: &Cell) -> f64 {
 
 /// Position of the requested metric named `name` among the resolved metrics.
 fn metric_position(resolved: &ResolvedQuery<'_>, name: &Name) -> Option<usize> {
-    resolved.metrics.iter().position(|h| metric_name(h) == name)
+    resolved.metrics.iter().position(|m| m.name() == name)
 }
 
 /// Compare two scores under `direction`. `Asc` is natural; `Desc` reverses.
@@ -670,37 +671,41 @@ fn permute<T: Clone>(v: Vec<T>, indices: &[usize]) -> Vec<T> {
 /// Evaluate every metric at a single tuple — the per-cell engine for the
 /// `Scalar` variant and the inner loops of `Series` / `Pivot`.
 fn metrics_at<'s>(
-    metrics: &[MetricHandle<'s>],
+    metrics: &[ResolvedMetric<'s>],
     tuple: &ResolvedTuple<'s>,
     cube: &'s InMemoryCube,
 ) -> Result<Vec<Cell>, Error> {
     metrics
         .iter()
-        .map(|h| evaluate_metric(h, tuple, cube))
+        .map(|m| evaluate_metric(m, tuple, cube))
         .collect()
 }
 
-/// Evaluate a single metric handle at a tuple.
+/// Evaluate a single query-position metric at a tuple.
 ///
-/// Measures and derived metrics both resolve by name through
-/// [`evaluate_expr`] — measures land on `Expr::Ref` that the metric
-/// evaluator dispatches to `evaluate_measure`, derived metrics walk
-/// their stored expression tree.
+/// An aggregated measure is re-aggregated by the query's function — the
+/// query is the sole authority for α, so the schema's declared rule is
+/// overridden. A derived metric walks its stored expression tree (whose
+/// nested measure refs keep their schema-declared aggregation).
 fn evaluate_metric<'s>(
-    handle: &MetricHandle<'s>,
+    metric: &ResolvedMetric<'s>,
     tuple: &ResolvedTuple<'s>,
     cube: &'s InMemoryCube,
 ) -> Result<Cell, Error> {
-    let name = metric_name(handle);
-    evaluate_expr(&Expr::Ref { name: name.clone() }, tuple, cube)
-}
-
-/// The underlying name of a [`MetricHandle`] — either the measure's or
-/// the metric's declared [`Name`].
-fn metric_name<'h, 's>(handle: &'h MetricHandle<'s>) -> &'h Name {
-    match handle {
-        MetricHandle::Measure(m) => &m.name,
-        MetricHandle::Metric(Metric { name, .. }) => name,
+    match metric {
+        ResolvedMetric::Aggregated { measure, agg } => evaluate_measure(
+            &measure.with_aggregation(agg.clone()),
+            tuple,
+            cube.df(),
+            &cube.schema,
+        ),
+        ResolvedMetric::Derived { metric } => evaluate_expr(
+            &Expr::Ref {
+                name: metric.name.clone(),
+            },
+            tuple,
+            cube,
+        ),
     }
 }
 
@@ -861,7 +866,10 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-            metrics: vec![n("amount"), n("units")],
+            metrics: vec![
+                tatami::query::Metric::aggregated(n("amount"), tatami::schema::Aggregation::sum()),
+                tatami::query::Metric::aggregated(n("units"), tatami::schema::Aggregation::sum()),
+            ],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -881,6 +889,82 @@ mod tests {
         }
     }
 
+    /// The per-query aggregation overrides the schema's declared rule.
+    /// `amount` is declared `Sum`, yet a query asking for `Avg`/`Min`/`Max`/
+    /// `Count`/`DistinctCount` gets that function — the function lives in the
+    /// query (α authority), not the schema.
+    #[test]
+    fn per_query_aggregation_overrides_schema_default() {
+        let cube = fixture_cube();
+        // amount over the four Actual rows: [100, 200, 300, 400].
+        let scalar = |agg: Aggregation| -> f64 {
+            let q = Query {
+                axes: Axes::Scalar,
+                slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
+                metrics: vec![tatami::query::Metric::aggregated(n("amount"), agg)],
+                options: tatami::query::Options::default(),
+            };
+            match run_query(&cube, q) {
+                Results::Scalar(s) => match &s.values()[0] {
+                    Cell::Valid { value, .. } => *value,
+                    other => panic!("expected Valid, got {other:?}"),
+                },
+                other => panic!("expected Scalar, got {other:?}"),
+            }
+        };
+        assert_eq!(scalar(Aggregation::sum()), 1000.0);
+        assert_eq!(scalar(Aggregation::avg()), 250.0);
+        assert_eq!(scalar(Aggregation::min()), 100.0);
+        assert_eq!(scalar(Aggregation::max()), 400.0);
+        assert_eq!(scalar(Aggregation::count()), 4.0);
+        assert_eq!(scalar(Aggregation::distinct_count()), 4.0);
+    }
+
+    /// Two functions over the *same* column coexist in one query — the
+    /// function is per-metric, not a query-global mode.
+    #[test]
+    fn same_column_two_functions_in_one_query() {
+        let cube = fixture_cube();
+        let q = Query {
+            axes: Axes::Scalar,
+            slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
+            metrics: vec![
+                tatami::query::Metric::aggregated(n("amount"), Aggregation::min()),
+                tatami::query::Metric::aggregated(n("amount"), Aggregation::max()),
+            ],
+            options: tatami::query::Options::default(),
+        };
+        match run_query(&cube, q) {
+            Results::Scalar(s) => {
+                assert_eq!(s.values().len(), 2, "one cell per metric");
+                assert!(matches!(&s.values()[0], Cell::Valid { value, .. } if *value == 100.0));
+                assert!(matches!(&s.values()[1], Cell::Valid { value, .. } if *value == 400.0));
+            }
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    /// A `Derived` reference to a *stored measure* (not a formula) evaluates
+    /// it by its schema-declared aggregation — the "use the schema's
+    /// definition" path a name-only caller (e.g. `CUBEVALUE`) relies on.
+    #[test]
+    fn derived_reference_to_measure_uses_declared_aggregation() {
+        let cube = fixture_cube();
+        let q = Query {
+            axes: Axes::Scalar,
+            slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
+            metrics: vec![tatami::query::Metric::derived(n("amount"))],
+            options: tatami::query::Options::default(),
+        };
+        match run_query(&cube, q) {
+            // amount is declared Sum → 100 + 200 + 300 + 400 = 1000.
+            Results::Scalar(s) => {
+                assert!(matches!(&s.values()[0], Cell::Valid { value, .. } if *value == 1000.0))
+            }
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
     #[test]
     fn series_query_returns_series_result() {
         let cube = fixture_cube();
@@ -889,7 +973,10 @@ mod tests {
                 rows: Set::members(n("Geography"), n("Default"), n("Region")),
             },
             slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -912,7 +999,10 @@ mod tests {
                 columns: Set::members(n("Scenario"), n("Default"), n("Plan")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -964,7 +1054,10 @@ mod tests {
                 columns: Set::members(n("Geography"), n("Default"), n("World")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -1032,7 +1125,10 @@ mod tests {
                 columns: Set::members(n("Time"), n("Fiscal"), n("Year")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -1063,7 +1159,10 @@ mod tests {
                 columns: Set::members(n("Scenario"), n("Default"), n("Plan")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount"), n("units")],
+            metrics: vec![
+                tatami::query::Metric::aggregated(n("amount"), tatami::schema::Aggregation::sum()),
+                tatami::query::Metric::aggregated(n("units"), tatami::schema::Aggregation::sum()),
+            ],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -1090,7 +1189,10 @@ mod tests {
                 columns: Set::members(n("Geography"), n("Default"), n("Country")),
             },
             slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -1182,7 +1284,10 @@ mod tests {
                 mr("Geography", "Default", &["EMEA"]),
             ])
             .expect("disjoint dims"),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -1252,7 +1357,10 @@ mod tests {
                 rows: Set::members(n("Geography"), n("Default"), n("Region")),
             },
             slicer: Tuple::single(mr("Time", "Default", &["2026-01"])),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options {
                 non_empty: true,
                 ..tatami::query::Options::default()
@@ -1277,7 +1385,10 @@ mod tests {
                 rows: Set::members(n("Geography"), n("Default"), n("Country")),
             },
             slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options {
                 order: vec![OrderBy {
                     key: OrderKey::Metric(n("amount")),
@@ -1310,7 +1421,10 @@ mod tests {
                 rows: Set::members(n("Geography"), n("Default"), n("Country")),
             },
             slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options {
                 order: vec![OrderBy {
                     key: OrderKey::Metric(n("amount")),
@@ -1345,7 +1459,10 @@ mod tests {
                 rows: Set::members(n("Geography"), n("Default"), n("Country")),
             },
             slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options {
                 rank: Some(tatami::query::Rank {
                     metric: n("amount"),
@@ -1388,7 +1505,10 @@ mod tests {
                     rows: Set::members(n("Geography"), n("Default"), n("Country")),
                 },
                 slicer: Tuple::single(mr("Scenario", "Default", &["Actual"])),
-                metrics: vec![n("amount")],
+                metrics: vec![tatami::query::Metric::aggregated(
+                    n("amount"),
+                    tatami::schema::Aggregation::sum(),
+                )],
                 options: tatami::query::Options {
                     order: vec![OrderBy {
                         key: OrderKey::Dimension(n("Geography")),
@@ -1450,7 +1570,7 @@ mod tests {
                 MRef::scenario(n("Actual")),
             ])
             .expect("disjoint"),
-            metrics: vec![n("Revenue")],
+            metrics: vec![tatami::query::Metric::derived(n("Revenue"))],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);
@@ -1484,7 +1604,10 @@ mod tests {
                 ),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let r = run_query(&cube, q);

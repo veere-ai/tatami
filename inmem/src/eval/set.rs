@@ -486,7 +486,10 @@ mod tests {
         let q = tatami::Query {
             axes: tatami::query::Axes::Series { rows: set },
             slicer: tatami::query::Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: tatami::query::Options::default(),
         };
         let rq = cube.resolve(&q).expect("resolve ok");

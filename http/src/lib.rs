@@ -394,7 +394,10 @@ mod tests {
         tatami::Query {
             axes: Axes::Scalar,
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         }
     }

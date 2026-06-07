@@ -203,7 +203,7 @@ fn evaluate_series_x(cube: &InMemoryCube, set: Set) -> HashSet<MemberRef> {
     let q = Query {
         axes: Axes::Series { rows: set },
         slicer: Tuple::empty(),
-        metrics: vec![fixture::n("Revenue")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Revenue"))],
         options: Options::default(),
     };
     let r = futures_block_on(cube.query(&q)).expect("series query ok");
@@ -227,7 +227,7 @@ fn evaluate_pivot_rows(cube: &InMemoryCube, rows: Set) -> Vec<Tuple> {
     let q = Query {
         axes: Axes::Pivot { rows, columns },
         slicer: Tuple::empty(),
-        metrics: vec![fixture::n("Revenue")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Revenue"))],
         options: Options::default(),
     };
     let r = futures_block_on(cube.query(&q)).expect("pivot query ok");
@@ -260,7 +260,7 @@ fn evaluate_probe_scalar(cube: &InMemoryCube, slicer: Tuple) -> Cell {
     let q = Query {
         axes: Axes::Scalar,
         slicer,
-        metrics: vec![fixture::n("Probe")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Probe"))],
         options: Options::default(),
     };
     let r = futures_block_on(cube.query(&q)).expect("scalar query ok");

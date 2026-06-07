@@ -293,7 +293,14 @@ async fn semi_additive_stock_rolls_up_via_last_not_sum_end_to_end() {
         axes: Axes::Scalar,
         // Empty slicer — Time is unbound, so the rollup rule fires.
         slicer: Tuple::empty(),
-        metrics: vec![fixture::n("stock")],
+        metrics: vec![tatami::query::Metric::aggregated(
+            fixture::n("stock"),
+            tatami::schema::Aggregation::semi_additive(
+                vec![fixture::n("Time")],
+                tatami::schema::SemiAgg::Last,
+            )
+            .expect("non-empty"),
+        )],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -323,7 +330,14 @@ async fn semi_additive_stock_pinned_to_month_returns_that_month_value() {
     let q = Query {
         axes: Axes::Scalar,
         slicer: Tuple::single(fixture::mr("Time", "Fiscal", &["FY2026", "Q1", "Feb"])),
-        metrics: vec![fixture::n("stock")],
+        metrics: vec![tatami::query::Metric::aggregated(
+            fixture::n("stock"),
+            tatami::schema::Aggregation::semi_additive(
+                vec![fixture::n("Time")],
+                tatami::schema::SemiAgg::Last,
+            )
+            .expect("non-empty"),
+        )],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -353,7 +367,7 @@ async fn fy2026_revenue_scalar_returns_expected_total() {
             ),
         ])
         .expect("disjoint"),
-        metrics: vec![fixture::n("Revenue")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Revenue"))],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -395,7 +409,7 @@ async fn quarterly_revenue_by_region_pivot_returns_grid() {
             fixture::n("Default"),
             Path::of(fixture::n("Actual")),
         )),
-        metrics: vec![fixture::n("Revenue")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Revenue"))],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -439,7 +453,16 @@ async fn plan_vs_whatif_variance_pivot_returns_grid() {
             .expect("non-empty"),
         },
         slicer: Tuple::single(fixture::mr("Time", "Fiscal", &["FY2026"])),
-        metrics: vec![fixture::n("amount"), fixture::n("units")],
+        metrics: vec![
+            tatami::query::Metric::aggregated(
+                fixture::n("amount"),
+                tatami::schema::Aggregation::sum(),
+            ),
+            tatami::query::Metric::aggregated(
+                fixture::n("units"),
+                tatami::schema::Aggregation::sum(),
+            ),
+        ],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -478,7 +501,10 @@ async fn sales_by_territory_series_returns_rows() {
             ),
         ])
         .expect("disjoint"),
-        metrics: vec![fixture::n("units")],
+        metrics: vec![tatami::query::Metric::aggregated(
+            fixture::n("units"),
+            tatami::schema::Aggregation::sum(),
+        )],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -507,7 +533,7 @@ async fn yoy_revenue_at_fy2026_jan_equals_hand_computed_growth() {
             ),
         ])
         .expect("disjoint"),
-        metrics: vec![fixture::n("RevenueYoY")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("RevenueYoY"))],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -543,7 +569,7 @@ async fn revenue_at_prior_fy_month_returns_fy2025_value_not_current() {
             ),
         ])
         .expect("disjoint"),
-        metrics: vec![fixture::n("Revenue")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Revenue"))],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -574,7 +600,7 @@ async fn ytd_revenue_accumulates_across_months_in_year() {
             ),
         ])
         .expect("disjoint"),
-        metrics: vec![fixture::n("RevenueYTD")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("RevenueYTD"))],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -595,7 +621,7 @@ async fn variance_equals_actual_minus_plan_at_each_cell() {
     let q = Query {
         axes: Axes::Scalar,
         slicer: Tuple::single(fixture::mr("Time", "Fiscal", &["FY2026", "Q1", "Jan2026"])),
-        metrics: vec![fixture::n("Variance")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("Variance"))],
         options: Options::default(),
     };
     let r = cube.query(&q).await.expect("query ok");
@@ -616,7 +642,7 @@ async fn query_with_unknown_metric_ref_fails_at_resolve_not_eval() {
     let q = Query {
         axes: Axes::Scalar,
         slicer: Tuple::empty(),
-        metrics: vec![fixture::n("DoesNotExist")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("DoesNotExist"))],
         options: Options::default(),
     };
     let err = cube.query(&q).await.expect_err("unresolved ref");
@@ -660,7 +686,7 @@ async fn query_with_lag_over_non_time_dim_fails_at_resolve() {
     let q = Query {
         axes: Axes::Scalar,
         slicer: Tuple::empty(),
-        metrics: vec![fixture::n("BadLag")],
+        metrics: vec![tatami::query::Metric::derived(fixture::n("BadLag"))],
         options: Options::default(),
     };
     let err = cube.query(&q).await.expect_err("bad lag");
@@ -694,7 +720,10 @@ async fn order_and_limit_apply_post_evaluation() {
             ),
         ])
         .expect("disjoint"),
-        metrics: vec![fixture::n("amount")],
+        metrics: vec![tatami::query::Metric::aggregated(
+            fixture::n("amount"),
+            tatami::schema::Aggregation::sum(),
+        )],
         options: Options {
             order: vec![OrderBy {
                 key: tatami::query::OrderKey::Metric(fixture::n("amount")),

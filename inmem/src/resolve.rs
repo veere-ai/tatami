@@ -23,7 +23,8 @@ use std::num::NonZeroUsize;
 
 use tatami::query::{Axes, MemberRef, Path, Predicate, Set, Tuple};
 use tatami::schema::{
-    Dimension, Hierarchy, Level, Measure, Metric, Name, NamedSet, Schema, dimension, metric,
+    Aggregation, Dimension, Hierarchy, Level, Measure, Metric, Name, NamedSet, Schema, dimension,
+    metric,
 };
 use tatami::{Query, query};
 
@@ -56,8 +57,10 @@ pub(crate) struct LevelHandle<'s> {
 
 /// Either a measure or a metric, resolved by name.
 ///
-/// `Query.metrics[*]` and `OrderBy.metric` both hold a bare [`Name`] that
-/// could point at either kind; [`MetricHandle`] records which.
+/// `OrderBy`/`Rank` keys, filter predicates, and `Set::TopN` all hold a bare
+/// [`Name`] that could point at either kind; [`MetricHandle`] records which.
+/// Query-position metrics use [`ResolvedMetric`] instead — it carries the
+/// per-query aggregation.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub(crate) enum MetricHandle<'s> {
@@ -65,6 +68,39 @@ pub(crate) enum MetricHandle<'s> {
     Measure(&'s Measure),
     /// The name resolved to a derived metric (formula).
     Metric(&'s Metric),
+}
+
+/// A resolved query-position metric — the counterpart of [`query::Metric`].
+///
+/// [`ResolvedMetric::Aggregated`] carries the per-query aggregation, so
+/// evaluation honours the query's function and never re-derives it from the
+/// schema. [`ResolvedMetric::Derived`] is a formula metric, evaluated as
+/// authored.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub(crate) enum ResolvedMetric<'s> {
+    /// Aggregate the resolved `measure` by the query's `agg`.
+    Aggregated {
+        /// The resolved stored measure.
+        measure: &'s Measure,
+        /// The per-query aggregation to apply.
+        agg: Aggregation,
+    },
+    /// A resolved derived (formula) metric.
+    Derived {
+        /// The resolved formula metric.
+        metric: &'s Metric,
+    },
+}
+
+impl<'s> ResolvedMetric<'s> {
+    /// The name this metric carries — the measure column or the formula name.
+    pub(crate) fn name(&self) -> &Name {
+        match self {
+            ResolvedMetric::Aggregated { measure, .. } => &measure.name,
+            ResolvedMetric::Derived { metric } => &metric.name,
+        }
+    }
 }
 
 /// A query that has been bound to a specific schema and member catalogue.
@@ -83,7 +119,7 @@ pub(crate) struct ResolvedQuery<'s> {
     /// Slicer tuple, resolved.
     pub(crate) slicer: ResolvedTuple<'s>,
     /// Metrics to evaluate per cell, resolved.
-    pub(crate) metrics: Vec<MetricHandle<'s>>,
+    pub(crate) metrics: Vec<ResolvedMetric<'s>>,
     /// Query-level tuning knobs. Carried through verbatim; `options.order`'s
     /// metrics have been validated during resolution but are kept as
     /// [`query::Options`] to avoid duplicating the ordering struct.
@@ -439,12 +475,12 @@ pub(crate) fn resolve<'s>(
     let metrics = q
         .metrics
         .iter()
-        .map(|name| resolve_metric_ref(&ctx, name))
+        .map(|m| resolve_query_metric(&ctx, m))
         .collect::<Result<Vec<_>, _>>()?;
-    // Walk each resolved metric's expr tree for Time-kind / level
+    // Walk each resolved derived metric's expr tree for Time-kind / level
     // membership checks that the schema builder does not perform.
-    for handle in &metrics {
-        if let MetricHandle::Metric(metric) = handle {
+    for m in &metrics {
+        if let ResolvedMetric::Derived { metric } = m {
             check_expr(&ctx, &metric.expr)?;
         }
     }
@@ -523,6 +559,54 @@ impl<'s> Ctx<'s> {
             .iter()
             .find(|ns| ns.name == *name)
             .ok_or_else(|| Error::ResolveUnknownNamedSet { name: name.clone() })
+    }
+
+    fn measure(&self, name: &Name) -> Result<&'s Measure, Error> {
+        self.schema
+            .measures
+            .iter()
+            .find(|m| m.name == *name)
+            .ok_or_else(|| Error::ResolveUnresolvedRef { name: name.clone() })
+    }
+
+    fn metric_def(&self, name: &Name) -> Result<&'s Metric, Error> {
+        self.schema
+            .metrics
+            .iter()
+            .find(|m| m.name == *name)
+            .ok_or_else(|| Error::ResolveUnresolvedRef { name: name.clone() })
+    }
+}
+
+/// Resolve a query-position metric against the schema.
+///
+/// `Aggregated` is the *override* path: `column` must name a stored measure,
+/// and the query's `agg` replaces its declared aggregation.
+///
+/// `Derived` is the *schema-defined* path: `name` resolves to a formula
+/// metric, or — falling back — to a stored measure evaluated by its own
+/// declared aggregation (so a caller that only has a name, e.g. a `CUBEVALUE`
+/// formula, gets the schema's natural behaviour rather than a forced default).
+fn resolve_query_metric<'s>(ctx: &Ctx<'s>, m: &query::Metric) -> Result<ResolvedMetric<'s>, Error> {
+    match m {
+        query::Metric::Aggregated { column, agg } => Ok(ResolvedMetric::Aggregated {
+            measure: ctx.measure(column)?,
+            agg: agg.clone(),
+        }),
+        query::Metric::Derived { name } => match ctx.metric_def(name) {
+            Ok(metric) => Ok(ResolvedMetric::Derived { metric }),
+            Err(_) => {
+                let measure = ctx.measure(name)?;
+                Ok(ResolvedMetric::Aggregated {
+                    measure,
+                    agg: measure.aggregation.clone(),
+                })
+            }
+        },
+        // `query::Metric` is `#[non_exhaustive]`; reject unknown future variants.
+        _ => Err(Error::ResolveSetCompositionIllFormed {
+            reason: "unknown query::Metric variant",
+        }),
     }
 }
 
@@ -948,13 +1032,19 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let rq = resolve(&q, &cube.schema, cube.catalogue()).expect("resolve ok");
         assert!(matches!(rq.axes, ResolvedAxes::Scalar));
         assert_eq!(rq.metrics.len(), 1);
-        assert!(matches!(rq.metrics[0], MetricHandle::Measure(_)));
+        assert!(matches!(
+            rq.metrics[0],
+            crate::resolve::ResolvedMetric::Aggregated { .. }
+        ));
     }
 
     #[test]
@@ -972,7 +1062,10 @@ mod tests {
         let q = Query {
             axes: Axes::Pivot { rows, columns },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let rq = resolve(&q, &cube.schema, cube.catalogue()).expect("resolve ok");
@@ -1008,7 +1101,10 @@ mod tests {
                 rows: Set::named(n("AllRegions")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let rq = resolve(&q, &cube.schema, cube.catalogue()).expect("resolve ok");
@@ -1024,7 +1120,7 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::empty(),
-            metrics: vec![n("NoSuchMetric")],
+            metrics: vec![tatami::query::Metric::derived(n("NoSuchMetric"))],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("unresolved");
@@ -1060,7 +1156,7 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::empty(),
-            metrics: vec![n("Lagged")],
+            metrics: vec![tatami::query::Metric::derived(n("Lagged"))],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("non-time lag");
@@ -1102,7 +1198,7 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::empty(),
-            metrics: vec![n("PTD")],
+            metrics: vec![tatami::query::Metric::derived(n("PTD"))],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("ptd level");
@@ -1125,7 +1221,10 @@ mod tests {
                 rows: left.cross(right),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("overlap");
@@ -1145,7 +1244,10 @@ mod tests {
                 rows: geo.union(time),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("union dims");
@@ -1161,7 +1263,10 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::single(MemberRef::new(n("Geography"), n("Default"), deep_path)),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("too-deep path");
@@ -1176,7 +1281,10 @@ mod tests {
                 rows: Set::members(n("Geography"), n("Default"), n("NoSuchLevel")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("unknown level");
@@ -1196,7 +1304,10 @@ mod tests {
                 rows: of.descendants_to(n("Region")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("to_level above");
@@ -1214,7 +1325,10 @@ mod tests {
                 rows: Set::range(n("Time"), n("Fiscal"), from, to),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("range levels");
@@ -1247,7 +1361,10 @@ mod tests {
                 rows: Set::named(n("A")),
             },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("cycle");
@@ -1266,7 +1383,10 @@ mod tests {
                 n("Default"),
                 Path::of(n("Mars")),
             )),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let err = resolve(&q, &cube.schema, cube.catalogue()).expect_err("absent member");
@@ -1283,7 +1403,10 @@ mod tests {
         let q = Query {
             axes: Axes::Series { rows },
             slicer: Tuple::empty(),
-            metrics: vec![n("amount")],
+            metrics: vec![tatami::query::Metric::aggregated(
+                n("amount"),
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let _ = resolve(&q, &cube.schema, cube.catalogue()).expect("filter resolves");

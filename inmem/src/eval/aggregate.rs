@@ -384,7 +384,10 @@ mod tests {
         let q = tatami::Query {
             axes: Axes::Scalar,
             slicer: t,
-            metrics: vec![metric],
+            metrics: vec![tatami::query::Metric::aggregated(
+                metric,
+                tatami::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let rq = cube.resolve(&q).expect("resolve ok");

@@ -33,6 +33,18 @@ impl Measure {
         self.unit = Some(unit);
         self
     }
+
+    /// This measure with its aggregation replaced. The per-query α override:
+    /// `query::Metric::Aggregated` carries a function, and evaluation applies
+    /// it by re-aggregating this column rather than using its declared rule.
+    #[must_use]
+    pub fn with_aggregation(&self, aggregation: Aggregation) -> Self {
+        Self {
+            name: self.name.clone(),
+            aggregation,
+            unit: self.unit.clone(),
+        }
+    }
 }
 
 /// The aggregation rule for a [`Measure`].

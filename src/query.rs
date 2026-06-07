@@ -7,6 +7,7 @@
 pub mod axes;
 pub mod error;
 pub mod member_ref;
+pub mod metric;
 pub mod options;
 pub mod path;
 pub mod predicate;
@@ -18,13 +19,12 @@ use serde::{Deserialize, Serialize};
 pub use axes::Axes;
 pub use error::Error;
 pub use member_ref::MemberRef;
+pub use metric::Metric;
 pub use options::{Direction, Options, OrderBy, OrderKey, Rank};
 pub use path::Path;
 pub use predicate::Predicate;
 pub use set::Set;
 pub use tuple::Tuple;
-
-use crate::schema::Name;
 
 /// A complete query: an axis projection, a slicer, a list of requested
 /// metrics, and tuning options.
@@ -38,8 +38,9 @@ pub struct Query {
     pub axes: Axes,
     /// The slicer — a tuple that pins the query to a subspace.
     pub slicer: Tuple,
-    /// The metrics to evaluate at each cell, in the order returned.
-    pub metrics: Vec<Name>,
+    /// The metrics to evaluate at each cell, in the order returned. Each is
+    /// an aggregated measure (carrying its own function) or a derived metric.
+    pub metrics: Vec<Metric>,
     /// Optional ordering, limit, and non-empty flag.
     pub options: Options,
 }
@@ -58,7 +59,10 @@ mod tests {
         let q = Query {
             axes: Axes::Scalar,
             slicer: Tuple::empty(),
-            metrics: vec![n("Revenue")],
+            metrics: vec![Metric::aggregated(
+                n("Revenue"),
+                crate::schema::Aggregation::sum(),
+            )],
             options: Options::default(),
         };
         let json = serde_json::to_string(&q).expect("serialize");
