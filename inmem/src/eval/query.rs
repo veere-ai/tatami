@@ -716,7 +716,7 @@ fn evaluate_metric<'s>(
 /// Dims unique to one side pass through. Incompatible same-dim
 /// members collapse the whole tuple to `None`, which the caller maps
 /// to [`Cell::Missing`].
-fn intersect<'s>(
+pub(crate) fn intersect<'s>(
     base: &ResolvedTuple<'s>,
     overlay: &ResolvedTuple<'s>,
 ) -> Option<ResolvedTuple<'s>> {

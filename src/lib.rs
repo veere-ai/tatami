@@ -63,6 +63,7 @@
 #![warn(missing_docs)]
 
 pub mod cube;
+pub mod drill;
 pub mod query;
 pub mod results;
 pub mod schema;

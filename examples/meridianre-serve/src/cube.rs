@@ -20,12 +20,16 @@ use tatami_inmem::InMemoryCube;
 /// Load the meridianre fact frame, derive the region column, build the
 /// schema, and return a constructed [`InMemoryCube`].
 pub fn build(csv_path: &Path) -> Result<InMemoryCube> {
-    let df = load_dataframe(csv_path)?;
-    let df = with_region(df)?;
-    let schema = build_schema()?;
+    let (df, schema) = facts(csv_path)?;
     let cube = InMemoryCube::new(df, schema)
         .context("InMemoryCube::new failed (check schema vs DataFrame columns)")?;
     Ok(cube)
+}
+
+/// Load the actual monthly-close fact grain and its reconciliation formulas.
+/// A host can apply its authorized row mask before constructing a drill view.
+pub fn facts(csv_path: &Path) -> Result<(DataFrame, Schema)> {
+    Ok((with_region(load_dataframe(csv_path)?)?, build_schema()?))
 }
 
 fn load_dataframe(path: &Path) -> Result<DataFrame> {

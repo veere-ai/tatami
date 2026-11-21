@@ -37,6 +37,7 @@
 //! crate is measured against.
 
 mod catalogue;
+pub mod drill;
 mod eval;
 mod resolve;
 
