@@ -14,6 +14,17 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    # rustls 0.22.4 from the same libsql -> hyper-rustls 0.25 chain.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+    # h2 0.3.27 from libsql -> tonic 0.11 -> axum 0.6 / hyper 0.14.
+    "RUSTSEC-2026-0258",
+    # skiplist 0.6 from polars-compute 0.51 (rolling windows). Resolved only
+    # by a polars upgrade; re-evaluate when polars is bumped.
+    "RUSTSEC-2026-0300",
+    "RUSTSEC-2026-0408",
+    "RUSTSEC-2026-0409",
     # bincode 1.x / 2.x — unmaintained warning. Pulled in by libsql and polars.
     "RUSTSEC-2025-0141",
     # rustls-pemfile — unmaintained. Pulled in by hyper-rustls 0.25.
