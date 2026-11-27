@@ -33,7 +33,7 @@ and metrics joined under a single `Cube` trait. Day-one consumers: the
   evaluates the full set + metric algebra (including semi-additive rollup,
   `Lag`, `PeriodsToDate`, and `At`-pinned coordinates).
 - **`examples/hewton`** — a worked hotel-sales cube. An iced application
-  that demonstrates all four `Results` shapes (Scalar, Series, Pivot,
+  that demonstrates four `Results` shapes (Scalar, Series, Pivot,
   Rollup) against a CSV-backed Hewton dataset.
 
 Future siblings (out of scope for v0.1): `tatami-polars-lazy`,
@@ -159,7 +159,15 @@ The canonical internal pipeline is `Query → ResolvedQuery → Results`
    `ResolvedQuery` and cannot fail for those reasons.
 2. **Evaluate.** Walk `ResolvedAxes` → concrete tuples, walk `Expr` →
    cells, assemble the `Results` shape per the `Axes` variant (Scalar,
-   Series, Pivot, or Rollup).
+   Series, CrossedSeries, Pivot, or Rollup).
+
+A one-axis query grouped by year and scenario returns the wire variant
+`crossed_series`. Its `groups` list identifies each dimension and hierarchy
+in requested order, including when the query returns zero coordinates. Each
+entry of `x` is a complete tuple, and each metric in `rows` has one cell per
+tuple. Single-member series retain the original `series` encoding. A remote
+that returns a legacy single-coordinate result for a known crossing cannot
+supply the requested grouping and the HTTP client reports an error.
 
 **Correctness target: observational equivalence with `tatami-inmem`.**
 Copy `tatami-inmem/tests/laws.rs` into your backend's `tests/` and

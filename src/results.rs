@@ -3,14 +3,16 @@
 //! Each shape lives in its own submodule:
 //! - [`scalar::Result`] — KPI tile, one cell tuple + one cell per metric.
 //! - [`series::Result`] — line / bar chart, shared x + one row per metric.
+//! - [`crossed::Result`] — row-only grouping by two or more dimensions.
 //! - [`pivot::Result`] — variance / heatmap table, 2-D cell grid.
 //! - [`rollup::Tree`] — hierarchical / map-ready, recursive subtree.
 //!
-//! The closed [`Results`] sum wraps the four so backends hand one typed
+//! The closed [`Results`] sum wraps these shapes so backends hand one typed
 //! value back per query (the `Axes → Results` mapping is total; see
 //! `.claude/map/v0-1/MAP_PLAN.md` §3.3).
 
 pub mod cell;
+pub mod crossed;
 pub mod error;
 pub mod pivot;
 pub mod rollup;
@@ -22,7 +24,7 @@ pub use error::Error;
 
 use serde::{Deserialize, Serialize};
 
-/// Closed sum of the four result shapes. The `Axes` variant of the original
+/// Sum of the supported result shapes. The `Axes` variant of the original
 /// [`crate::Query`] determines which variant the backend returns (mapping
 /// documented in MAP §3.3).
 ///
@@ -37,6 +39,8 @@ pub enum Results {
     Scalar(scalar::Result),
     /// Shared x-axis + one row per metric — line/bar chart shape.
     Series(series::Result),
+    /// A row-only series with each full coordinate and its ordered groups.
+    CrossedSeries(crossed::Result),
     /// Row/column headers + 2-D cell grid — pivot/variance table shape.
     Pivot(pivot::Result),
     /// Recursive `(root, value, children)` tree — rollup/choropleth shape.

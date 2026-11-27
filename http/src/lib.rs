@@ -18,6 +18,7 @@
 #![warn(missing_docs)]
 
 mod error;
+mod series;
 
 use std::sync::Arc;
 
@@ -133,6 +134,16 @@ impl tatami::Cube for Remote {
             .json()
             .await
             .map_err(Error::Decode)?;
+        if let (tatami::Axes::Series { rows }, tatami::Results::Series(_)) = (&q.axes, &res) {
+            let crossed = match series::crossed(rows, None)? {
+                Some(known) => known,
+                None => series::crossed(rows, Some(self.fetch_schema_cached().await?))?
+                    .ok_or(Error::UnverifiedGrouping)?,
+            };
+            if crossed {
+                return Err(Error::FlattenedSeries);
+            }
+        }
         Ok(res)
     }
 
@@ -288,6 +299,106 @@ mod tests {
         let r = Remote::new(server.uri()).unwrap();
         let q = sample_query();
         let _ = r.query(&q).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn crossed_query_keeps_a_typed_empty_domain_and_refuses_a_legacy_server() {
+        let n = |s| Name::parse(s).unwrap();
+        let rows = tatami::Set::members(n("year"), n("Default"), n("year")).cross(
+            tatami::Set::members(n("scenario"), n("Default"), n("scenario")),
+        );
+        let mut q = sample_query();
+        q.axes = Axes::Series { rows: rows.clone() };
+        let payload = serde_json::json!({"crossed_series":{
+            "groups":[{"dim":"year","hierarchy":"Default"},{"dim":"scenario","hierarchy":"Default"}],
+            "x":[], "rows":[{"label":"Revenue","values":[]}]
+        }});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cube/query"))
+            .and(body_json(&q))
+            .respond_with(ResponseTemplate::new(200).set_body_json(payload))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let remote = Remote::new(server.uri()).unwrap();
+        let tatami::Results::CrossedSeries(result) = remote.query(&q).await.unwrap() else {
+            panic!("lost domain")
+        };
+        assert_eq!(result.groups()[1].dim, n("scenario"));
+
+        let old = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cube/query"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"series":{"x":[],"rows":[]}})),
+            )
+            .expect(3)
+            .mount(&old)
+            .await;
+        let mut schema: Schema = serde_json::from_str(&sample_schema_json()).unwrap();
+        schema
+            .named_sets
+            .push(tatami::schema::NamedSet::new(n("plan"), rows));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cube/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(schema))
+            .expect(1)
+            .mount(&old)
+            .await;
+        let remote = Remote::new(old.uri()).unwrap();
+        assert!(matches!(
+            remote.query(&q).await,
+            Err(Error::FlattenedSeries)
+        ));
+        q.axes = Axes::Series {
+            rows: tatami::Set::named(n("plan")),
+        };
+        assert!(matches!(
+            remote.query(&q).await,
+            Err(Error::FlattenedSeries)
+        ));
+        q.axes = Axes::Series {
+            rows: tatami::Set::members(n("year"), n("Default"), n("year")),
+        };
+        assert!(matches!(
+            remote.query(&q).await,
+            Ok(tatami::Results::Series(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn crossed_response_keeps_each_full_member_path_and_its_reported_cell() {
+        let n = |s| Name::parse(s).unwrap();
+        let mut q = sample_query();
+        q.axes = Axes::Series {
+            rows: tatami::Set::members(n("year"), n("Fiscal"), n("year")).cross(
+                tatami::Set::members(n("scenario"), n("Default"), n("scenario")),
+            ),
+        };
+        let reply = serde_json::json!({"crossed_series":{
+            "groups":[{"dim":"year","hierarchy":"Fiscal"},{"dim":"scenario","hierarchy":"Default"}],
+            "x":[[{"dim":"year","hierarchy":"Fiscal","path":["2025"]},{"dim":"scenario","hierarchy":"Default","path":["plan","budget"]}]],
+            "rows":[{"label":"nep","values":[{"state":"valid","value":426500000.86,"unit":null,"format":null}]}]
+        }});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/cube/query"))
+            .and(body_json(&q))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tatami::Results::CrossedSeries(result) =
+            Remote::new(server.uri()).unwrap().query(&q).await.unwrap()
+        else {
+            panic!("expected typed coordinates")
+        };
+        assert_eq!(result.x()[0].members()[1].path.to_string(), "plan/budget");
+        assert!(
+            matches!(result.rows()[0].values[0],Cell::Valid {value, ..} if value == 426_500_000.86)
+        );
     }
 
     /// 5xx response from the server is reported as `Error::Status`, not eaten.

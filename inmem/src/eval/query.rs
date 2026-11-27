@@ -6,7 +6,7 @@
 //! | `Axes`                         | `Results`                                                |
 //! |---                             |---                                                       |
 //! | `Scalar`                       | `Scalar`                                                 |
-//! | `Series { rows }`              | `Series`                                                 |
+//! | `Series { rows }`              | `Series` or `CrossedSeries` for a crossed grouping        |
 //! | `Pivot { rows, columns }`      | `Pivot` — or `Rollup` when `rows` is a top-level, single-rooted `Descendants` |
 //! | `Pages { rows, columns, pages }` | `Pivot` with stacked column headers (page × column)    |
 //!
@@ -50,14 +50,14 @@ use std::cmp::Ordering;
 use tatami::query::{Direction, MemberRef, OrderKey, Path, Tuple};
 use tatami::schema::Name;
 use tatami::schema::metric::Expr;
-use tatami::{Cell, Results, missing, pivot, rollup, scalar, series};
+use tatami::{Cell, Results, crossed, missing, pivot, rollup, scalar, series};
 
-use crate::Error;
-use crate::InMemoryCube;
 use crate::eval::aggregate::evaluate_measure;
+use crate::eval::domain::{self, Domain};
 use crate::eval::metric::evaluate_expr;
 use crate::eval::set;
 use crate::resolve::{ResolvedAxes, ResolvedMember, ResolvedMetric, ResolvedQuery, ResolvedTuple};
+use crate::{Error, InMemoryCube};
 
 /// Evaluate a resolved query end-to-end, producing a typed [`Results`]
 /// value.
@@ -93,8 +93,7 @@ fn evaluate_scalar<'s>(
     Ok(Results::Scalar(scalar::Result::new(tuple, values)))
 }
 
-/// `Axes::Series { rows }` — rows × metrics, with the row tuples' members
-/// as the shared x-axis. One [`series::Row`] per metric.
+/// Build a shared domain from the resolved axis and one vector per metric.
 fn evaluate_series<'s>(
     resolved: &ResolvedQuery<'s>,
     rows: &crate::resolve::ResolvedSet<'s>,
@@ -102,22 +101,7 @@ fn evaluate_series<'s>(
 ) -> Result<Results, Error> {
     let row_tuples = prune_axis_by_slicer(set::evaluate(rows, cube)?, &resolved.slicer);
 
-    // Build the `Vec<MemberRef>` x-axis from each row tuple's sole member.
-    // A series-axis tuple may carry any number of members (cross-joined);
-    // the renderer expects a single member per x entry, so fall back to
-    // the first member when multiple are present. Single-dim row-sets are
-    // the v0.1 norm.
-    let mut x: Vec<MemberRef> = Vec::with_capacity(row_tuples.len());
-    for tuple in &row_tuples {
-        let first = tuple
-            .members
-            .first()
-            .ok_or(Error::EvalSetCompositionIllFormed {
-                reason: "Series row tuple has no members",
-            })?;
-        x.push(member_ref_of(first));
-    }
-
+    let domain = Domain::of(rows)?;
     // Assemble per-metric rows. For each metric, walk every row tuple
     // (intersected with the slicer) and evaluate. An empty intersection
     // (slicer pins a dim with a path incompatible with the row) yields
@@ -136,10 +120,32 @@ fn evaluate_series<'s>(
         series_rows.push(series::Row { label, values });
     }
 
-    // Apply non-empty / order / limit to the rows.
-    let (x, series_rows) = apply_options_series(x, series_rows, resolved);
-
-    Ok(Results::Series(series::Result::new(x, series_rows)))
+    let order = apply_options_series(&row_tuples, &mut series_rows, resolved);
+    match domain {
+        Domain::Crossed(groups) => {
+            let x = order
+                .into_iter()
+                .map(|i| domain::coordinate(&groups, &row_tuples[i]))
+                .collect::<Result<_, _>>()?;
+            Ok(Results::CrossedSeries(crossed::Result::new(
+                groups,
+                x,
+                series_rows,
+            )?))
+        }
+        Domain::Members(_) => {
+            let x = order
+                .into_iter()
+                .map(|i| match row_tuples[i].members.as_slice() {
+                    [member] => Ok(member_ref_of(member)),
+                    _ => Err(Error::EvalSetCompositionIllFormed {
+                        reason: "member series requires one member per position",
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Results::Series(series::Result::new(x, series_rows)))
+        }
+    }
 }
 
 /// `Axes::Pivot { rows, columns }` — rows × columns grid, one cell per
@@ -474,36 +480,21 @@ fn insert_by_path(root: &mut rollup::Tree, root_depth: usize, mref: &MemberRef, 
     cursor.value = cell;
 }
 
-/// Apply `options.non_empty`, `options.order`, `options.limit` to a series.
-/// Non-empty drops rows where every metric's value is `Missing`; order
-/// sorts x by the first OrderBy's metric's values; limit truncates x.
+/// Select and order positions once. The same indices determine every metric
+/// vector and the public domain, so a discarded tuple is never materialized.
 fn apply_options_series(
-    mut x: Vec<MemberRef>,
-    mut rows: Vec<series::Row>,
+    tuples: &[ResolvedTuple<'_>],
+    rows: &mut [series::Row],
     resolved: &ResolvedQuery<'_>,
-) -> (Vec<MemberRef>, Vec<series::Row>) {
+) -> Vec<usize> {
     let opts = &resolved.options;
-
-    // Non-empty: drop x entries where every row has a Missing cell at that
-    // index. `Error` cells are informative and kept.
+    let mut idx: Vec<usize> = (0..tuples.len()).collect();
     if opts.non_empty {
-        let keep: Vec<bool> = (0..x.len())
-            .map(|i| {
-                rows.iter()
-                    .any(|r| !matches!(r.values[i], Cell::Missing { .. }))
-            })
-            .collect();
-        x = filter_by_mask(x, &keep);
-        for r in rows.iter_mut() {
-            r.values = filter_by_mask(std::mem::take(&mut r.values), &keep);
-        }
+        idx.retain(|&i| {
+            rows.iter()
+                .any(|row| !matches!(row.values[i], Cell::Missing { .. }))
+        });
     }
-
-    // Position order: top-N rank (an independent rank metric), then the
-    // display ordering (dimension member or metric value, first key primary),
-    // then the limit. `permute` reorders + truncates in one pass.
-    let mut idx: Vec<usize> = (0..x.len()).collect();
-
     let mut ranked = false;
     if let Some(rank) = &opts.rank {
         if let Some(mi) = metric_position(resolved, &rank.metric) {
@@ -522,8 +513,8 @@ fn apply_options_series(
                     sort_indices_by_metric(&mut idx, &rows[mi].values, ob.direction);
                 }
             }
-            OrderKey::Dimension(_) => {
-                sort_indices_by_member(&mut idx, &x, ob.direction);
+            OrderKey::Dimension(name) => {
+                sort_indices_by_member(&mut idx, tuples, name, ob.direction);
             }
         }
     }
@@ -532,16 +523,10 @@ fn apply_options_series(
         idx.truncate(n.get().min(idx.len()));
     }
 
-    let x = permute(x, &idx);
-    let rows = rows
-        .into_iter()
-        .map(|mut row| {
-            row.values = permute(std::mem::take(&mut row.values), &idx);
-            row
-        })
-        .collect();
-
-    (x, rows)
+    for row in rows {
+        row.values = permute(std::mem::take(&mut row.values), &idx);
+    }
+    idx
 }
 
 /// Apply `options.non_empty`, `options.order`, `options.limit` to a pivot.
@@ -631,9 +616,21 @@ fn sort_indices_by_metric(idx: &mut [usize], values: &[Cell], direction: Directi
 
 /// Stable-sort `idx` by the x-axis member's path key at each index, in
 /// `direction` (lexical; ISO dates sort chronologically).
-fn sort_indices_by_member(idx: &mut [usize], x: &[MemberRef], direction: Direction) {
+fn sort_indices_by_member(
+    idx: &mut [usize],
+    x: &[ResolvedTuple<'_>],
+    dim: &Name,
+    direction: Direction,
+) {
     idx.sort_by(|&a, &b| {
-        let base = x[a].path.to_string().cmp(&x[b].path.to_string());
+        let path = |index: usize| match x[index].members.as_slice() {
+            [only] => Some(only.path.to_string()),
+            members => members
+                .iter()
+                .find(|member| &member.dim.dim.name == dim)
+                .map(|member| member.path.to_string()),
+        };
+        let base = path(a).cmp(&path(b));
         match direction {
             Direction::Desc => base.reverse(),
             _ => base,
@@ -790,7 +787,7 @@ fn tuple_of(resolved: &ResolvedTuple<'_>) -> Tuple {
 }
 
 /// Project a [`ResolvedMember`] to a public [`MemberRef`].
-fn member_ref_of(member: &ResolvedMember<'_>) -> MemberRef {
+pub(super) fn member_ref_of(member: &ResolvedMember<'_>) -> MemberRef {
     MemberRef::new(
         member.dim.dim.name.clone(),
         member.hierarchy.hierarchy.name.clone(),
@@ -807,8 +804,9 @@ mod tests {
     use tatami::query::{
         Axes, Direction, MemberRef as MRef, OrderBy, OrderKey, Path, Predicate, Set, Tuple,
     };
+    use tatami::schema::metric::Expr;
     use tatami::schema::{
-        Aggregation, Calendar, Dimension, Hierarchy, Level, Measure, Metric, Schema, metric::Expr,
+        Aggregation, Calendar, Dimension, Hierarchy, Level, Measure, Metric, Schema,
     };
     use tatami::{Cube, Query};
 

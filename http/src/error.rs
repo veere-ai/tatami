@@ -35,6 +35,14 @@ pub enum Error {
     #[error("response decode error: {0}")]
     Decode(#[source] reqwest::Error),
 
+    /// The remote backend returned one member per position for a crossed axis.
+    #[error("backend returned a single-coordinate series for a crossed grouping")]
+    FlattenedSeries,
+
+    /// The schema could not establish the coordinate shape of a legacy response.
+    #[error("cannot verify the grouping of the backend's legacy series")]
+    UnverifiedGrouping,
+
     /// A [`tatami::MemberRelation`] variant added upstream isn't yet known
     /// to this client. Surfaces only after a tatami upgrade until this
     /// crate catches up; never on stable builds where the workspace is

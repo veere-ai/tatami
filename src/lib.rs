@@ -18,7 +18,7 @@
 //! 2. `ResolvedQuery` (crate-internal to each backend) — refs bound to
 //!    schema handles; structural checks (cross-join disjointness,
 //!    hierarchy existence) done.
-//! 3. [`Results`] — a closed sum over the four result shapes.
+//! 3. [`Results`] — a tagged sum of the supported result shapes.
 //!
 //! `Query → ResolvedQuery → Results` is three types, not one type with
 //! a status field. The library's invariants are structural: if you can
@@ -81,4 +81,4 @@ pub use schema::metric::Expr;
 
 pub use cube::{Cube, MemberRelation};
 pub use results::cell::missing;
-pub use results::{Cell, Results, cell, pivot, rollup, scalar, series};
+pub use results::{Cell, Results, cell, crossed, pivot, rollup, scalar, series};
