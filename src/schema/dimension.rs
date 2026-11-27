@@ -140,13 +140,30 @@ pub struct Level {
     pub name: Name,
     /// Key column used to identify members at this level in the fact source.
     pub key: Name,
+    /// Column that orders this level's members among their siblings: each
+    /// member ranks by the smallest value its rows carry, and members with
+    /// equal or no rank fall back to their names. A date column gives months
+    /// in calendar order where their names would sort `Apr`, `Aug`, `Dec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Name>,
 }
 
 impl Level {
-    /// Construct a level.
+    /// Construct a level whose members sort by name.
     #[must_use]
     pub fn new(name: Name, key: Name) -> Self {
-        Self { name, key }
+        Self {
+            name,
+            key,
+            order: None,
+        }
+    }
+
+    /// Fluent: order this level's members by the values of `column`.
+    #[must_use]
+    pub fn ordered_by(mut self, column: Name) -> Self {
+        self.order = Some(column);
+        self
     }
 }
 
@@ -183,6 +200,19 @@ mod tests {
         let json = serde_json::to_string(&dim).expect("serialize");
         let back: Dimension = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(dim, back);
+    }
+
+    #[test]
+    fn an_ordered_level_roundtrips_and_an_unordered_one_keeps_its_old_form() {
+        let plain = Level::new(n("Month"), n("month"));
+        assert_eq!(
+            serde_json::to_string(&plain).expect("serialize"),
+            r#"{"name":"Month","key":"month"}"#
+        );
+        let ordered = plain.ordered_by(n("date"));
+        let json = serde_json::to_string(&ordered).expect("serialize");
+        let back: Level = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(ordered, back);
     }
 
     #[test]

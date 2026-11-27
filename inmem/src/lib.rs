@@ -591,6 +591,16 @@ fn validate_dimensions(df: &DataFrame, dimensions: &[Dimension]) -> Result<(), E
                         dtype: format_dtype(dtype),
                     });
                 }
+                if let Some(order) = &level.order
+                    && find_column(df, order.as_str()).is_none()
+                {
+                    return Err(Error::MissingLevelColumn {
+                        dim: dim.name.clone(),
+                        hierarchy: hierarchy.name.clone(),
+                        level: level.name.clone(),
+                        column: order.clone(),
+                    });
+                }
             }
         }
     }

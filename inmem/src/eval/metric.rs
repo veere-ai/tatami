@@ -905,6 +905,86 @@ mod tests {
         );
     }
 
+    /// A fiscal year from April: FY2025 ends Feb, Mar; FY2026 opens Apr,
+    /// May, Jun. Month names sort Apr, Feb, Jun, Mar, May; `period` orders
+    /// them as the calendar does.
+    fn fiscal_fixture() -> InMemoryCube {
+        let schema = Schema::builder()
+            .dimension(
+                Dimension::time(n("Time"), vec![Calendar::gregorian(n("Gregorian"))]).hierarchy(
+                    Hierarchy::new(n("Fiscal"))
+                        .level(Level::new(n("Year"), n("year")).ordered_by(n("period")))
+                        .level(Level::new(n("Month"), n("month")).ordered_by(n("period"))),
+                ),
+            )
+            .measure(Measure::new(n("amount"), Aggregation::sum()))
+            .build()
+            .expect("schema");
+        let df = df! {
+            "year"   => ["FY2026", "FY2025", "FY2026", "FY2025", "FY2026"],
+            "month"  => ["Jun", "Feb", "Apr", "Mar", "May"],
+            "period" => [202506_i64, 202502, 202504, 202503, 202505],
+            "amount" => [6.0_f64, 2.0, 4.0, 3.0, 5.0],
+        }
+        .expect("frame");
+        InMemoryCube::new(df, schema).expect("cube")
+    }
+
+    #[test]
+    fn ordered_months_enumerate_lag_and_accumulate_chronologically() {
+        let cube = fiscal_fixture();
+        let months: Vec<String> = cube
+            .catalogue()
+            .members_at(&n("Time"), &n("Fiscal"), 1)
+            .expect("catalogued")
+            .iter()
+            .map(|m| {
+                m.path
+                    .segments()
+                    .map(Name::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        assert_eq!(
+            months,
+            [
+                "FY2025/Feb",
+                "FY2025/Mar",
+                "FY2026/Apr",
+                "FY2026/May",
+                "FY2026/Jun"
+            ]
+        );
+        let at = |month: &str| {
+            slicer(
+                &cube,
+                Tuple::of(vec![mr("Time", "Fiscal", &["FY2026", month])]).expect("disjoint"),
+            )
+        };
+        // Lag(1) at the first fiscal month is the prior year's last month.
+        let lag = Expr::Lag {
+            of: Box::new(Expr::Ref { name: n("amount") }),
+            dim: n("Time"),
+            n: 1,
+        };
+        let cell = evaluate_expr(&lag, &at("Apr"), &cube).expect("eval ok");
+        assert!(
+            matches!(cell, Cell::Valid { value, .. } if value == 3.0),
+            "{cell:?}"
+        );
+        // Year to date at May: Apr + May, not Apr alone as name order gives.
+        let ytd = Expr::PeriodsToDate {
+            of: Box::new(Expr::Ref { name: n("amount") }),
+            level: n("Year"),
+        };
+        let cell = evaluate_expr(&ytd, &at("May"), &cube).expect("eval ok");
+        assert!(
+            matches!(cell, Cell::Valid { value, .. } if value == 9.0),
+            "{cell:?}"
+        );
+    }
+
     #[test]
     fn periods_to_date_idempotence() {
         // M6 holds strictly only at the first period of the window: the

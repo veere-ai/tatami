@@ -29,13 +29,96 @@ pub(crate) struct Catalogue {
 
 /// A node in a per-hierarchy member tree.
 ///
-/// Children are keyed by the member's own level-value (a [`Name`]) and stored
-/// in a [`BTreeMap`] so iteration order is deterministic — snapshot tests and
-/// later [`tatami::query::Set::Members`] enumeration depend on stable
-/// ordering.
+/// Children are keyed by the member's own level-value (a [`Name`]) for
+/// lookup, and enumerate in `sequence`: by the rank their level's order
+/// column gives them, then by name, so iteration order is deterministic and
+/// months come out in calendar order when a date column orders them.
 #[derive(Debug, Default)]
 pub(crate) struct Node {
     children: BTreeMap<Name, Node>,
+    /// The smallest value of the level's order column across this member's
+    /// rows, when the level has one.
+    rank: Option<Rank>,
+    /// The children's names in enumeration order, set once the tree is built.
+    sequence: Vec<Name>,
+}
+
+impl Node {
+    /// The children in enumeration order.
+    fn ordered(&self) -> impl Iterator<Item = (&Name, &Node)> {
+        self.sequence
+            .iter()
+            .filter_map(|name| self.children.get_key_value(name))
+    }
+
+    /// Fix every node's enumeration order once all rows are in. Ranked
+    /// members come first, in rank order; ties and unranked members sort by
+    /// name.
+    fn seal(&mut self) {
+        for child in self.children.values_mut() {
+            child.seal();
+        }
+        let mut sequence: Vec<(&Name, Option<&Rank>)> = self
+            .children
+            .iter()
+            .map(|(name, child)| (name, child.rank.as_ref()))
+            .collect();
+        sequence.sort_by(|(a, left), (b, right)| match (left, right) {
+            (Some(left), Some(right)) => left.cmp(right).then_with(|| a.cmp(b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(b),
+        });
+        self.sequence = sequence.into_iter().map(|(name, _)| name.clone()).collect();
+    }
+}
+
+/// A value of a level's order column: numbers (dates and times among them)
+/// before text.
+#[derive(Clone, Debug)]
+enum Rank {
+    Number(f64),
+    Text(String),
+}
+
+impl PartialEq for Rank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Rank {}
+
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Rank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Rank::Number(a), Rank::Number(b)) => a.total_cmp(b),
+            (Rank::Number(_), Rank::Text(_)) => std::cmp::Ordering::Less,
+            (Rank::Text(_), Rank::Number(_)) => std::cmp::Ordering::Greater,
+            (Rank::Text(a), Rank::Text(b)) => a.cmp(b),
+        }
+    }
+}
+
+impl Rank {
+    fn of(value: &AnyValue<'_>) -> Option<Self> {
+        match value {
+            AnyValue::Null => None,
+            AnyValue::String(s) => Some(Rank::Text((*s).to_owned())),
+            AnyValue::StringOwned(s) => Some(Rank::Text(s.to_string())),
+            other => Some(
+                other
+                    .extract::<f64>()
+                    .map_or_else(|| Rank::Text(other.to_string()), Rank::Number),
+            ),
+        }
+    }
 }
 
 impl Catalogue {
@@ -198,11 +281,21 @@ fn build_tree(
         })
         .collect();
 
+    let orders: Vec<_> = levels
+        .iter()
+        .map(|level| {
+            level.order.as_ref().map(|order| {
+                df.column(order.as_str())
+                    .expect("phase 5a validation guarantees every order column exists")
+            })
+        })
+        .collect();
+
     let height = df.height();
     for row in 0..height {
         let mut cursor = &mut root;
         let mut abort_row = false;
-        for (level, column) in levels.iter().zip(columns.iter()) {
+        for ((level, column), order) in levels.iter().zip(columns.iter()).zip(orders.iter()) {
             let any = column
                 .get(row)
                 .expect("row index is within column height; validated above");
@@ -221,11 +314,22 @@ fn build_tree(
                 value: raw,
             })?;
             cursor = cursor.children.entry(name).or_default();
+            if let Some(order) = order {
+                let rank = order
+                    .get(row)
+                    .expect("row index is within column height; validated above");
+                if let Some(rank) = Rank::of(&rank)
+                    && cursor.rank.as_ref().is_none_or(|least| rank < *least)
+                {
+                    cursor.rank = Some(rank);
+                }
+            }
         }
         // `abort_row` just stops walking this row; the next row gets a fresh
         // cursor from `root`.
         let _ = abort_row;
     }
+    root.seal();
     Ok(root)
 }
 
@@ -277,11 +381,10 @@ fn member_ref(dim: &Name, hierarchy: &Name, segments: &[Name]) -> MemberRef {
     MemberRef::new(dim.clone(), hierarchy.clone(), path)
 }
 
-/// Direct children of `node`, in BTreeMap order.
+/// Direct children of `node`, in enumeration order.
 fn children(node: &Node, dim: &Name, hierarchy: &Name, at: &[Name]) -> Vec<MemberRef> {
-    node.children
-        .keys()
-        .map(|child| {
+    node.ordered()
+        .map(|(child, _)| {
             let mut segs = at.to_vec();
             segs.push(child.clone());
             member_ref(dim, hierarchy, &segs)
@@ -302,7 +405,7 @@ fn collect_descendants(
     if remaining == 0 {
         return;
     }
-    for (child_name, child_node) in &node.children {
+    for (child_name, child_node) in node.ordered() {
         let mut segs = at.to_vec();
         segs.push(child_name.clone());
         out.push(member_ref(dim, hierarchy, &segs));
@@ -320,7 +423,7 @@ fn collect_leaves(
     at: &[Name],
     out: &mut Vec<MemberRef>,
 ) {
-    for (child_name, child_node) in &node.children {
+    for (child_name, child_node) in node.ordered() {
         let mut segs = at.to_vec();
         segs.push(child_name.clone());
         if child_node.children.is_empty() {
@@ -343,14 +446,14 @@ fn collect_at_depth(
     out: &mut Vec<MemberRef>,
 ) {
     if depth == 0 {
-        for child_name in node.children.keys() {
+        for (child_name, _) in node.ordered() {
             let mut segs = at.to_vec();
             segs.push(child_name.clone());
             out.push(member_ref(dim, hierarchy, &segs));
         }
         return;
     }
-    for (child_name, child_node) in &node.children {
+    for (child_name, child_node) in node.ordered() {
         let mut segs = at.to_vec();
         segs.push(child_name.clone());
         collect_at_depth(child_node, dim, hierarchy, &segs, depth - 1, out);
