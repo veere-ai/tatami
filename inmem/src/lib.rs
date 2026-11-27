@@ -459,6 +459,10 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// Full series coordinates or metric rows failed validation.
+    #[error(transparent)]
+    CrossedSeries(#[from] tatami::crossed::Error),
+
     /// A set evaluator reached a `ResolvedSet` whose shape it could not
     /// evaluate — for example, a cross-join as the argument of `Children`,
     /// or an `Explicit` set with members spanning multiple dims under

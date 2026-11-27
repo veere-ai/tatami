@@ -26,6 +26,7 @@
 //! [`ResolvedTuple`]: crate::resolve::ResolvedTuple
 
 pub(crate) mod aggregate;
+mod domain;
 pub(crate) mod metric;
 pub(crate) mod query;
 pub(crate) mod set;
